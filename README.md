@@ -1,2 +1,2 @@
 # ffmpeg-vulkan
-FFMPEG h264 vulkan decode example
+An example of using the FFMPEG library for vulkan h264 decode to YUV420p.
