@@ -1,10 +1,16 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
+
 #include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
+
 #include <libavformat/avformat.h>
+
 #include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -60,38 +66,158 @@ void process_hardware_frame(AVCodecContext* dec_ctx, AVFrame* hw_frame)
   av_frame_free(&cpu_frame);
 }
 
+void process_scaling(AVCodecContext* dec_ctx, AVFrame* hw_frame, int target_width, int target_height)
+{
+  av_log_set_level(AV_LOG_DEBUG);
+
+  AVFrame* scaled_frame = nullptr;
+  AVFilterContext* scale_ctx = nullptr;
+  enum AVPixelFormat pix_fmts[] = {AV_PIX_FMT_VAAPI, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P};
+
+  const AVFilter* buffer_src = avfilter_get_by_name("buffer");
+  const AVFilter* buffer_sink = avfilter_get_by_name("buffersink");
+  const AVFilter* scale_vaapi = avfilter_get_by_name("scale_vaapi");
+
+  int ret;
+  AVFilterContext *buffer_src_ctx = NULL, *buffer_sink_ctx = NULL;
+  AVBufferSrcParameters* par = NULL;
+
+  // Initialize the filter graph
+  AVFilterGraph* graph = avfilter_graph_alloc();
+  if (!graph) {
+    std::cerr << "Could not allocate filter graph\n";
+    goto fail;
+  }
+
+  par = av_buffersrc_parameters_alloc();
+  if (!par) {
+    std::cerr << "Could not allocate parameters\n";
+    goto fail;
+  }
+
+  buffer_src_ctx = avfilter_graph_alloc_filter(graph, buffer_src, "buffersrc");
+  if (!buffer_src_ctx) {
+    std::cerr << "Could not allocate AVFilterContext\n";
+    goto fail;
+  }
+
+  par->format = hw_frame->format;
+  par->time_base = (AVRational){1, 1};
+  par->width = hw_frame->width;
+  par->height = hw_frame->height;
+  par->hw_frames_ctx = hw_frame->hw_frames_ctx;
+  ret = av_buffersrc_parameters_set(buffer_src_ctx, par);
+  if (ret < 0) {
+    std::cerr << "Could not set parameters\n";
+    goto fail;
+  }
+
+  ret = avfilter_init_dict(buffer_src_ctx, NULL);
+  if (ret < 0)
+    goto fail;
+
+  buffer_sink_ctx = avfilter_graph_alloc_filter(graph, buffer_sink, "buffersink");
+  if (!buffer_sink_ctx) {
+    ret = AVERROR(ENOMEM);
+    goto fail;
+  }
+
+  // Create and configure scaling filter
+  char args[1024];
+  snprintf(args, sizeof(args), "w=%d:h=%d:format=%s", target_width, target_height, "nv12");
+
+  if (avfilter_graph_create_filter(&scale_ctx, scale_vaapi, "scale", args, nullptr, graph) < 0) {
+    std::cerr << "Could not create scaling filter\n";
+    goto fail;
+  }
+
+  // Set the allowed pixel formats for the sink
+  ret = av_opt_set_bin(buffer_sink_ctx, "pix_fmts", (const uint8_t*)pix_fmts, sizeof(pix_fmts), AV_OPT_SEARCH_CHILDREN);
+  if (ret < 0) {
+    std::cerr << "Could not set output pixel format\n";
+    goto fail;
+  }
+
+  ret = avfilter_init_str(buffer_sink_ctx, nullptr);
+  if (ret < 0) {
+    std::cerr << "Could not initialize buffersink\n";
+    goto fail;
+  }
+
+  // Connect the filters
+  if (avfilter_link(buffer_src_ctx, 0, scale_ctx, 0) < 0) {
+    std::cerr << "Could not link buffer source to scale filter\n";
+    goto fail;
+  }
+
+  if (avfilter_link(scale_ctx, 0, buffer_sink_ctx, 0) < 0) {
+    std::cerr << "Could not link scale filter to buffer sink\n";
+    goto fail;
+  }
+
+  // Configure the graph
+  if (avfilter_graph_config(graph, nullptr) < 0) {
+    std::cerr << "Could not configure filter graph\n";
+    goto fail;
+  }
+
+  // Push the frame to the filter graph
+  if (av_buffersrc_add_frame(buffer_src_ctx, hw_frame) < 0) {
+    std::cerr << "Error while feeding the frame to the filter graph\n";
+    goto fail;
+  }
+
+  // Retrieve the scaled frame
+  scaled_frame = av_frame_alloc();
+  if (!scaled_frame) {
+    std::cerr << "Could not allocate scaled frame\n";
+    goto fail;
+  }
+
+  while (av_buffersink_get_frame(buffer_sink_ctx, scaled_frame) >= 0) {
+    process_hardware_frame(dec_ctx, scaled_frame);
+    av_frame_unref(scaled_frame);
+  }
+
+// Cleanup
+fail:
+  if (scaled_frame)
+    av_frame_free(&scaled_frame);
+  if (graph)
+    avfilter_graph_free(&graph);
+  if (par)
+    av_freep(&par);
+}
+
 static int set_hwframe_ctx(AVCodecContext* ctx, AVBufferRef* hw_device_ctx, AVPixelFormat pix_fmt)
 {
-  AVBufferRef* hw_frames_ref;
-  AVHWFramesContext* frames_ctx = NULL;
-  int err = 0;
-
-  if (!(hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx))) {
+  AVBufferRef* hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
+  if (!hw_frames_ref) {
     fprintf(stderr, "Failed to create hardware frame context.\n");
     return -1;
   }
-  frames_ctx = (AVHWFramesContext*)(hw_frames_ref->data);
-  frames_ctx->format = pix_fmt;
-  frames_ctx->sw_format = AV_PIX_FMT_NV12;
-  frames_ctx->width = 1920;
-  frames_ctx->height = 1080;
+
+  AVHWFramesContext* frames_ctx = (AVHWFramesContext*)(hw_frames_ref->data);
+  frames_ctx->format = pix_fmt; // Hardware pixel format
+  frames_ctx->sw_format = AV_PIX_FMT_NV12; // Software pixel format for transfer
+  frames_ctx->width = 1920; // Replace with your frame width
+  frames_ctx->height = 1080; // Replace with your frame height
   frames_ctx->initial_pool_size = 20;
-  if ((err = av_hwframe_ctx_init(hw_frames_ref)) < 0) {
-    char error_str[1024];
-    av_make_error_string(error_str, sizeof(error_str), err);
-    fprintf(stderr,
-            "Failed to initialize VAAPI frame context."
-            "Error code: %s\n",
-            error_str);
+
+  if (av_hwframe_ctx_init(hw_frames_ref) < 0) {
+    fprintf(stderr, "Failed to initialize hardware frame context.\n");
     av_buffer_unref(&hw_frames_ref);
-    return err;
+    return -1;
   }
+
   ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
-  if (!ctx->hw_frames_ctx)
-    err = AVERROR(ENOMEM);
+  if (!ctx->hw_frames_ctx) {
+    av_buffer_unref(&hw_frames_ref);
+    return AVERROR(ENOMEM);
+  }
 
   av_buffer_unref(&hw_frames_ref);
-  return err;
+  return 0;
 }
 
 static AVCodecContext* OpenVideoStream(AVFormatContext* fmt_ctx, int stream_idx, AVHWDeviceType device_type)
@@ -225,7 +351,7 @@ bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt, int wid
     case AV_PIX_FMT_VAAPI:
     case AV_PIX_FMT_VULKAN:
     case AV_PIX_FMT_VDPAU:
-      process_hardware_frame(dec_ctx, frame);
+      process_scaling(dec_ctx, frame, width, height);
       break;
     default:
       std::cerr << "Unknown pixel format " << av_get_pix_fmt_name((AVPixelFormat)frame->format) << std::endl;
@@ -239,7 +365,6 @@ bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt, int wid
 
   return true;
 }
-
 
 int main(int argc, char* argv[])
 {
