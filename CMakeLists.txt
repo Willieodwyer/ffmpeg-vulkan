@@ -23,4 +23,3 @@ target_link_libraries(example PRIVATE
 #target_link_libraries(example PRIVATE ${FFMPEG_LIBRARIES})
 
 target_link_libraries(example PRIVATE Vulkan::Vulkan)
-

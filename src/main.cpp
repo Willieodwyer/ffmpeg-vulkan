@@ -1,15 +1,18 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
 #include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
-#include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 }
 
 #include <chrono>
 #include <fstream>
 #include <iostream>
 
+#define WRITE
 
 #ifdef WRITE
 std::ofstream image("image.yuv", std::ios::binary);
@@ -57,6 +60,40 @@ void process_hardware_frame(AVCodecContext* dec_ctx, AVFrame* hw_frame)
   av_frame_free(&cpu_frame);
 }
 
+static int set_hwframe_ctx(AVCodecContext* ctx, AVBufferRef* hw_device_ctx, AVPixelFormat pix_fmt)
+{
+  AVBufferRef* hw_frames_ref;
+  AVHWFramesContext* frames_ctx = NULL;
+  int err = 0;
+
+  if (!(hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx))) {
+    fprintf(stderr, "Failed to create hardware frame context.\n");
+    return -1;
+  }
+  frames_ctx = (AVHWFramesContext*)(hw_frames_ref->data);
+  frames_ctx->format = pix_fmt;
+  frames_ctx->sw_format = AV_PIX_FMT_NV12;
+  frames_ctx->width = 1920;
+  frames_ctx->height = 1080;
+  frames_ctx->initial_pool_size = 20;
+  if ((err = av_hwframe_ctx_init(hw_frames_ref)) < 0) {
+    char error_str[1024];
+    av_make_error_string(error_str, sizeof(error_str), err);
+    fprintf(stderr,
+            "Failed to initialize VAAPI frame context."
+            "Error code: %s\n",
+            error_str);
+    av_buffer_unref(&hw_frames_ref);
+    return err;
+  }
+  ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
+  if (!ctx->hw_frames_ctx)
+    err = AVERROR(ENOMEM);
+
+  av_buffer_unref(&hw_frames_ref);
+  return err;
+}
+
 static AVCodecContext* OpenVideoStream(AVFormatContext* fmt_ctx, int stream_idx, AVHWDeviceType device_type)
 {
   AVCodecParameters* codecpar = fmt_ctx->streams[stream_idx]->codecpar;
@@ -71,35 +108,38 @@ static AVCodecContext* OpenVideoStream(AVFormatContext* fmt_ctx, int stream_idx,
   std::cout << "Width: " << codecpar->width << " Height: " << codecpar->height << std::endl;
   std::cout << "Bitrate: " << codecpar->bit_rate << std::endl;
 
-  AVCodecContext* context;
-  context = avcodec_alloc_context3(NULL);
-  if (!context) {
+  AVCodecContext* codec_ctx;
+  codec_ctx = avcodec_alloc_context3(NULL);
+  if (!codec_ctx) {
     printf("avcodec_alloc_context3 failed");
     return NULL;
   }
 
-  int result = avcodec_parameters_to_context(context, fmt_ctx->streams[stream_idx]->codecpar);
+  int result = avcodec_parameters_to_context(codec_ctx, fmt_ctx->streams[stream_idx]->codecpar);
   if (result < 0) {
     char error_str[1024];
     av_make_error_string(error_str, sizeof(error_str), result);
     printf("avcodec_parameters_to_context failed: %s\n", error_str);
-    avcodec_free_context(&context);
+    avcodec_free_context(&codec_ctx);
     return NULL;
   }
-  context->pkt_timebase = fmt_ctx->streams[stream_idx]->time_base;
+  codec_ctx->pkt_timebase = fmt_ctx->streams[stream_idx]->time_base;
 
   if (device_type != AV_HWDEVICE_TYPE_NONE) {
     /* Look for supported hardware accelerated configurations */
     int i = 0;
-    const AVCodecHWConfig *config = nullptr, *accel_config = nullptr;
-    while ((config = avcodec_get_hw_config(decoder, i++)) != NULL) {
-      printf("Found %s hardware acceleration with pixel format %s\n", av_hwdevice_get_type_name(config->device_type),
-             av_get_pix_fmt_name(config->pix_fmt));
+    const AVCodecHWConfig* accel_config = nullptr;
+    {
+      const AVCodecHWConfig* config = nullptr;
+      while ((config = avcodec_get_hw_config(decoder, i++)) != NULL) {
+        printf("Found %s hardware acceleration with pixel format %s\n", av_hwdevice_get_type_name(config->device_type),
+               av_get_pix_fmt_name(config->pix_fmt));
 
-      if (config->device_type != device_type || !(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
-        continue;
+        if (config->device_type != device_type || !(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+          continue;
+        }
+        accel_config = config;
       }
-      accel_config = config;
     }
 
     if (!accel_config) {
@@ -107,7 +147,7 @@ static AVCodecContext* OpenVideoStream(AVFormatContext* fmt_ctx, int stream_idx,
       return nullptr;
     }
 
-    result = av_hwdevice_ctx_create(&context->hw_device_ctx, accel_config->device_type, NULL, NULL, 0);
+    result = av_hwdevice_ctx_create(&codec_ctx->hw_device_ctx, accel_config->device_type, NULL, NULL, 0);
     if (result < 0) {
       char error_str[1024];
       av_make_error_string(error_str, sizeof(error_str), result);
@@ -118,30 +158,39 @@ static AVCodecContext* OpenVideoStream(AVFormatContext* fmt_ctx, int stream_idx,
       printf(" -- Using %s hardware acceleration with pixel format %s\n",
              av_hwdevice_get_type_name(accel_config->device_type), av_get_pix_fmt_name(accel_config->pix_fmt));
     }
-  }
 
+    codec_ctx->pix_fmt = accel_config->pix_fmt;
+  }
 
   if (codecpar->codec_id == AV_CODEC_ID_VVC) {
-    context->strict_std_compliance = -2;
+    codec_ctx->strict_std_compliance = -2;
 
     /* Enable threaded decoding, VVC decode is slow */
-    context->thread_count = 4;
-    context->thread_type = (FF_THREAD_FRAME | FF_THREAD_SLICE);
+    codec_ctx->thread_count = 4;
+    codec_ctx->thread_type = (FF_THREAD_FRAME | FF_THREAD_SLICE);
   }
+  else
+    codec_ctx->thread_count = 1;
 
-  result = avcodec_open2(context, decoder, NULL);
-  if (result < 0) {
-    char error_str[1024];
-    av_make_error_string(error_str, sizeof(error_str), result);
-    printf("Couldn't open codec %s: %s", avcodec_get_name(context->codec_id), error_str);
-    avcodec_free_context(&context);
+  int err = set_hwframe_ctx(codec_ctx, codec_ctx->hw_device_ctx, codec_ctx->pix_fmt);
+  if (err < 0) {
+    fprintf(stderr, "Failed to set hwframe context.\n");
     return NULL;
   }
 
-  return context;
+  result = avcodec_open2(codec_ctx, decoder, NULL);
+  if (result < 0) {
+    char error_str[1024];
+    av_make_error_string(error_str, sizeof(error_str), result);
+    printf("Couldn't open codec %s: %s", avcodec_get_name(codec_ctx->codec_id), error_str);
+    avcodec_free_context(&codec_ctx);
+    return NULL;
+  }
+
+  return codec_ctx;
 }
 
-bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt)
+bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt, int width, int height)
 {
   int ret = avcodec_send_packet(dec_ctx, pkt);
   if (ret < 0) {
@@ -173,9 +222,9 @@ bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt)
       }
 #endif
       break;
+    case AV_PIX_FMT_VAAPI:
     case AV_PIX_FMT_VULKAN:
     case AV_PIX_FMT_VDPAU:
-    case AV_PIX_FMT_VAAPI:
       process_hardware_frame(dec_ctx, frame);
       break;
     default:
@@ -191,6 +240,7 @@ bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt)
   return true;
 }
 
+
 int main(int argc, char* argv[])
 {
   AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_VULKAN;
@@ -203,6 +253,12 @@ int main(int argc, char* argv[])
       hw_type = AV_HWDEVICE_TYPE_VDPAU;
     if (strcmp(argv[1], "none") == 0)
       hw_type = AV_HWDEVICE_TYPE_NONE;
+  }
+
+  int width = 0, height = 0;
+  if (argc >= 4) {
+    width = std::stoi(argv[2]);
+    height = std::stoi(argv[3]);
   }
 
   auto str = av_hwdevice_get_type_name(hw_type);
@@ -251,14 +307,15 @@ int main(int argc, char* argv[])
   auto start = std::chrono::high_resolution_clock::now();
   while (av_read_frame(fmt_ctx, pkt) >= 0) {
     if (pkt->stream_index == video_stream_index) {
-      if (!DecodeFrame(dec_ctx, frame, pkt))
+      if (!DecodeFrame(dec_ctx, frame, pkt, width, height)) {
+        av_packet_unref(pkt);
         break;
-
+      }
       av_packet_unref(pkt);
     }
   }
 
-  DecodeFrame(dec_ctx, frame, nullptr); // Flush the decoder
+  DecodeFrame(dec_ctx, frame, nullptr, width, height); // Flush the decoder
 
   auto finish = std::chrono::high_resolution_clock::now();
   std::cout << "Time taken: " << std::chrono::duration_cast<std::chrono::milliseconds>(finish - start).count()
