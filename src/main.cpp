@@ -66,17 +66,27 @@ void process_hardware_frame(AVCodecContext* dec_ctx, AVFrame* hw_frame)
   av_frame_free(&cpu_frame);
 }
 
-void process_scaling(AVCodecContext* dec_ctx, AVFrame* hw_frame, int target_width, int target_height)
+void process_with_scaling(AVCodecContext* dec_ctx, AVFrame* hw_frame, int target_width, int target_height)
 {
   av_log_set_level(AV_LOG_DEBUG);
 
+  std::string filter = "none";
+  if (hw_frame->format == AV_PIX_FMT_VAAPI)
+    filter = "scale_vaapi";
+  else if (hw_frame->format == AV_PIX_FMT_VULKAN)
+    filter = "scale_vulkan";
+  else if (hw_frame->format == AV_PIX_FMT_VDPAU) {
+    std::cerr << "VDPAU scaling not supported\n";
+    return;
+  }
+
   AVFrame* scaled_frame = nullptr;
   AVFilterContext* scale_ctx = nullptr;
-  enum AVPixelFormat pix_fmts[] = {AV_PIX_FMT_VAAPI, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P};
+  enum AVPixelFormat pix_fmts[] = {(AVPixelFormat)hw_frame->format};
 
   const AVFilter* buffer_src = avfilter_get_by_name("buffer");
   const AVFilter* buffer_sink = avfilter_get_by_name("buffersink");
-  const AVFilter* scale_vaapi = avfilter_get_by_name("scale_vaapi");
+  const AVFilter* scale_hardware = avfilter_get_by_name(filter.c_str());
 
   int ret;
   AVFilterContext *buffer_src_ctx = NULL, *buffer_sink_ctx = NULL;
@@ -126,7 +136,7 @@ void process_scaling(AVCodecContext* dec_ctx, AVFrame* hw_frame, int target_widt
   char args[1024];
   snprintf(args, sizeof(args), "w=%d:h=%d:format=%s", target_width, target_height, "nv12");
 
-  if (avfilter_graph_create_filter(&scale_ctx, scale_vaapi, "scale", args, nullptr, graph) < 0) {
+  if (avfilter_graph_create_filter(&scale_ctx, scale_hardware, "scale", args, nullptr, graph) < 0) {
     std::cerr << "Could not create scaling filter\n";
     goto fail;
   }
@@ -189,7 +199,8 @@ fail:
     av_freep(&par);
 }
 
-static int set_hwframe_ctx(AVCodecContext* ctx, AVBufferRef* hw_device_ctx, AVPixelFormat pix_fmt)
+static int set_hwframe_ctx(AVCodecContext* ctx, AVBufferRef* hw_device_ctx, AVPixelFormat pix_fmt, int width,
+                           int height)
 {
   AVBufferRef* hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
   if (!hw_frames_ref) {
@@ -200,8 +211,8 @@ static int set_hwframe_ctx(AVCodecContext* ctx, AVBufferRef* hw_device_ctx, AVPi
   AVHWFramesContext* frames_ctx = (AVHWFramesContext*)(hw_frames_ref->data);
   frames_ctx->format = pix_fmt; // Hardware pixel format
   frames_ctx->sw_format = AV_PIX_FMT_NV12; // Software pixel format for transfer
-  frames_ctx->width = 1920; // Replace with your frame width
-  frames_ctx->height = 1080; // Replace with your frame height
+  frames_ctx->width = width;
+  frames_ctx->height = height;
   frames_ctx->initial_pool_size = 20;
 
   if (av_hwframe_ctx_init(hw_frames_ref) < 0) {
@@ -298,10 +309,13 @@ static AVCodecContext* OpenVideoStream(AVFormatContext* fmt_ctx, int stream_idx,
   else
     codec_ctx->thread_count = 1;
 
-  int err = set_hwframe_ctx(codec_ctx, codec_ctx->hw_device_ctx, codec_ctx->pix_fmt);
-  if (err < 0) {
-    fprintf(stderr, "Failed to set hwframe context.\n");
-    return NULL;
+  if (codec_ctx->hw_device_ctx) {
+    int err =
+        set_hwframe_ctx(codec_ctx, codec_ctx->hw_device_ctx, codec_ctx->pix_fmt, codecpar->width, codecpar->height);
+    if (err < 0) {
+      fprintf(stderr, "Failed to set hwframe context.\n");
+      return NULL;
+    }
   }
 
   result = avcodec_open2(codec_ctx, decoder, NULL);
@@ -351,7 +365,10 @@ bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt, int wid
     case AV_PIX_FMT_VAAPI:
     case AV_PIX_FMT_VULKAN:
     case AV_PIX_FMT_VDPAU:
-      process_scaling(dec_ctx, frame, width, height);
+      if (width > 0 && height > 0)
+        process_with_scaling(dec_ctx, frame, width, height);
+      else
+        process_hardware_frame(dec_ctx, frame);
       break;
     default:
       std::cerr << "Unknown pixel format " << av_get_pix_fmt_name((AVPixelFormat)frame->format) << std::endl;
@@ -368,6 +385,7 @@ bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt, int wid
 
 int main(int argc, char* argv[])
 {
+
   AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_VULKAN;
   if (argc >= 2) {
     if (strcmp(argv[1], "vulkan") == 0)
