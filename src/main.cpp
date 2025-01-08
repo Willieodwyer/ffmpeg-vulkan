@@ -12,11 +12,15 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <vulkan/vulkan.h>
 }
 
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <vector>
+
+#include "vulkan_image_scaling.h"
 
 #define WRITE
 
@@ -68,13 +72,18 @@ void process_hardware_frame(AVCodecContext* dec_ctx, AVFrame* hw_frame)
 
 void process_with_scaling(AVCodecContext* dec_ctx, AVFrame* hw_frame, int target_width, int target_height)
 {
+  if (hw_frame->format == AV_PIX_FMT_VULKAN) {
+    if (vk_scale_image(hw_frame, target_width, target_height))
+      return;
+
+    return; // Success!?
+  }
+
   av_log_set_level(AV_LOG_DEBUG);
 
   std::string filter = "none";
   if (hw_frame->format == AV_PIX_FMT_VAAPI)
     filter = "scale_vaapi";
-  else if (hw_frame->format == AV_PIX_FMT_VULKAN)
-    filter = "scale_vulkan";
   else if (hw_frame->format == AV_PIX_FMT_VDPAU) {
     std::cerr << "VDPAU scaling not supported\n";
     return;
@@ -385,6 +394,13 @@ bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt, int wid
 
 int main(int argc, char* argv[])
 {
+  if (init_vulkan()) {
+    std::cout << "Vulkan device initialized successfully!" << std::endl;
+    // You can now use the device for Vulkan operations
+  }
+  else {
+    std::cerr << "Vulkan initialization failed!" << std::endl;
+  }
 
   AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_VULKAN;
   if (argc >= 2) {
