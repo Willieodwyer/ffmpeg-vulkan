@@ -1,6 +1,8 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 
+#include <libswscale/swscale.h>
+
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
@@ -18,11 +20,7 @@ extern "C" {
 #include <fstream>
 #include <iostream>
 
-#define WRITE
-
-#ifdef WRITE
-std::ofstream image("image.yuv", std::ios::binary);
-#endif
+#include "SoftwareScale.h"
 
 void process_hardware_frame(AVCodecContext* dec_ctx, AVFrame* hw_frame)
 {
@@ -68,13 +66,15 @@ void process_hardware_frame(AVCodecContext* dec_ctx, AVFrame* hw_frame)
 
 void process_with_scaling(AVCodecContext* dec_ctx, AVFrame* hw_frame, int target_width, int target_height)
 {
-  av_log_set_level(AV_LOG_DEBUG);
+  // av_log_set_level(AV_LOG_DEBUG);
 
   std::string filter = "none";
   if (hw_frame->format == AV_PIX_FMT_VAAPI)
     filter = "scale_vaapi";
-  else if (hw_frame->format == AV_PIX_FMT_VULKAN)
-    filter = "scale_vulkan";
+  else if (hw_frame->format == AV_PIX_FMT_VULKAN) {
+    scale_incompatible_hwframe(dec_ctx, hw_frame, target_width, target_height);
+    return;
+  }
   else if (hw_frame->format == AV_PIX_FMT_VDPAU) {
     std::cerr << "VDPAU scaling not supported\n";
     return;
@@ -210,7 +210,7 @@ static int set_hwframe_ctx(AVCodecContext* ctx, AVBufferRef* hw_device_ctx, AVPi
 
   AVHWFramesContext* frames_ctx = (AVHWFramesContext*)(hw_frames_ref->data);
   frames_ctx->format = pix_fmt; // Hardware pixel format
-  frames_ctx->sw_format = AV_PIX_FMT_NV12; // Software pixel format for transfer
+  frames_ctx->sw_format = AV_PIX_FMT_YUV420P; // Software pixel format for transfer
   frames_ctx->width = width;
   frames_ctx->height = height;
   frames_ctx->initial_pool_size = 20;
@@ -352,15 +352,24 @@ bool DecodeFrame(AVCodecContext* dec_ctx, AVFrame* frame, AVPacket* pkt, int wid
     // std::cout << "Decoded frame at " << frame->pts << "\n";
     switch (frame->format) {
     case AV_PIX_FMT_YUV420P:
-#ifdef WRITE
-      for (int plane = 0; plane < 3; ++plane) {
-        auto height = frame->height / (frame->width / frame->linesize[plane]);
-        for (int i = 0; i < height; ++i) {
-          image.write(reinterpret_cast<const char*>(frame->data[plane] + (i * frame->linesize[plane])),
-                      frame->linesize[plane]);
+      // Scale frame if width and height are specified
+      if (width > 0 && height > 0) {
+        if (!software_scale(frame, width, height)) {
+          std::cerr << "Error scaling frame\n";
+          return false;
         }
       }
+      else {
+#ifdef WRITE
+        for (int plane = 0; plane < 3; ++plane) {
+          auto height = frame->height / (frame->width / frame->linesize[plane]);
+          for (int i = 0; i < height; ++i) {
+            image.write(reinterpret_cast<const char*>(frame->data[plane] + (i * frame->linesize[plane])),
+                        frame->linesize[plane]);
+          }
+        }
 #endif
+      }
       break;
     case AV_PIX_FMT_VAAPI:
     case AV_PIX_FMT_VULKAN:

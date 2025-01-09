@@ -10,7 +10,8 @@ find_package(Vulkan REQUIRED)
 
 add_subdirectory(src)
 
-add_executable(example ${SOURCES})
+add_executable(example ${SOURCES}
+        src/SoftwareScale.h)
 target_link_libraries(example PRIVATE
         avcodec
         avutil
